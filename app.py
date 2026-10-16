@@ -21,7 +21,8 @@ from datetime import date, datetime, timedelta
 from database import (
     init_db, save_project, update_project, get_all_projects, 
     get_project_by_id, delete_project, get_next_project_code,
-    get_received_cash_records, get_pending_payment_followups
+    get_received_cash_records, get_pending_payment_followups,
+    export_database_json, import_database_json, is_cloud_enabled
 )
 from scheduler_engine import generate_schedule, DISCIPLINE_TEMPLATES
 from export_utils import generate_excel_schedule, format_whatsapp_proposal
@@ -567,16 +568,59 @@ with tab_followups:
 
 # ---------------- TAB 5: EXPORT & CLIENT SHARE ----------------
 with tab_export:
+    # 1. ALWAYS VISIBLE: Cloud Database Status & 1-Tap Mobile Backup/Restore
+    st.subheader("💾 Database Backup & Cloud Sync")
+    
+    with st.container(border=True):
+        st.markdown("#### ☁️ Cloud Database Status")
+        if is_cloud_enabled():
+            st.success("🟢 **Connected to Supabase Cloud Database!** Your data is permanently synchronized 24/7 in the cloud.")
+        else:
+            st.info("🟡 **Running on Local Database.** To enable permanent 24/7 cloud sync across all devices, configure your Supabase keys in Streamlit Secrets.")
+
+    col_bk1, col_bk2 = st.columns(2)
+
+    with col_bk1:
+        st.markdown("#### 📥 1-Tap Mobile Backup")
+        st.write("Download a complete backup of all your projects directly to your phone or computer:")
+        backup_json = export_database_json()
+        st.download_button(
+            label="⬇️ Download All Projects Backup (.json)",
+            data=backup_json,
+            file_name=f"eng_scheduler_backup_{date.today().strftime('%Y%m%d')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+    with col_bk2:
+        st.markdown("#### 📤 Restore / Import Backup")
+        st.write("Restore projects from a backup file anytime:")
+        uploaded_backup = st.file_uploader("Upload Backup JSON", type=["json"], key="backup_upload")
+        if uploaded_backup is not None:
+            if st.button("🔄 Restore Database from File", use_container_width=True):
+                content = uploaded_backup.read().decode("utf-8")
+                ok, msg = import_database_json(content)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.write("---")
+
+    # 2. Individual Project Export (Excel & WhatsApp)
+    st.subheader("📋 Project Proposal & Excel Export")
     all_projects = get_all_projects()
+
     if not all_projects:
-        st.info("No projects available to export.")
+        st.info("No projects created yet. Go to '➕ 1. New Project Intake' to create your first project schedule.")
     else:
         active_id = st.session_state.get("active_proj_id", all_projects[0]["id"])
         selected_project = get_project_by_id(active_id)
 
         if selected_project:
             cur = selected_project.get("currency") or "EGP"
-            st.subheader(f"📤 Export: {selected_project.get('project_code', '')} - {selected_project['name']}")
+            st.markdown(f"### Exporting: **{selected_project.get('project_code', '')}** — {selected_project['name']}")
 
             # Live Status Summary Box using Streamlit native theme-aware container (Dark & Light mode compatible)
             is_fin = bool(selected_project.get("is_finished", 0))

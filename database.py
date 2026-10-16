@@ -1,22 +1,57 @@
 """
-SQLite Database layer for Engineering Project Scheduler.
-Supports automatic project code numbering (e.g. 26-0001), completion tracking,
-cash receipt dates, monthly financial aggregation, and follow-up logging.
+Hybrid Database layer for Engineering Project Scheduler.
+Supports:
+1. Permanent Cloud Storage via Supabase (PostgreSQL REST API)
+2. Local SQLite fallback (projects.db)
+3. 1-Tap JSON Backup & Restore for mobile and desktop
 """
 
 import sqlite3
 import json
+import os
+import requests
 from datetime import datetime, date
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "projects.db"
 
+# ---------------- CLOUD DB CONFIGURATION (SUPABASE) ----------------
+def get_cloud_credentials():
+    """Retrieves Supabase credentials from Streamlit secrets or environment variables."""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
+            return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
+    except Exception:
+        pass
+
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if url and key:
+        return url, key
+    return None, None
+
+def is_cloud_enabled():
+    url, key = get_cloud_credentials()
+    return bool(url and key)
+
+def get_supabase_headers():
+    url, key = get_cloud_credentials()
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+# ---------------- LOCAL SQLITE INITIALIZATION ----------------
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    # Always ensure local sqlite is ready as fallback
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -68,15 +103,28 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ---------------- PROJECT CODE GENERATOR ----------------
 def get_next_project_code():
-    """
-    Generates sequential project code starting with current 2-digit year.
-    Example: 26-0001, 26-0002, 26-0003...
-    """
+    year_prefix = datetime.now().strftime("%y")  # '26' for 2026
+
+    if is_cloud_enabled():
+        url, _ = get_cloud_credentials()
+        try:
+            res = requests.get(
+                f"{url}/rest/v1/projects?project_code=like.{year_prefix}-*&order=project_code.desc&limit=1",
+                headers=get_supabase_headers(),
+                timeout=5
+            )
+            if res.status_code == 200 and res.json():
+                last_code = res.json()[0]['project_code']
+                last_seq = int(last_code.split("-")[1])
+                return f"{year_prefix}-{last_seq + 1:04d}"
+            return f"{year_prefix}-0001"
+        except Exception:
+            pass
+
     conn = get_connection()
     cursor = conn.cursor()
-    year_prefix = datetime.now().strftime("%y")  # '26' for 2026
-    
     cursor.execute("SELECT project_code FROM projects WHERE project_code LIKE ? ORDER BY project_code DESC LIMIT 1", (f"{year_prefix}-%",))
     row = cursor.fetchone()
     conn.close()
@@ -91,16 +139,10 @@ def get_next_project_code():
     except (IndexError, ValueError):
         return f"{year_prefix}-0001"
 
+# ---------------- CRUD OPERATIONS ----------------
 def save_project(project_data):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    code = project_data.get('project_code')
-    if not code:
-        code = get_next_project_code()
-
+    code = project_data.get('project_code') or get_next_project_code()
     scheduled_end = project_data.get('scheduled_end_date') or project_data.get('deadline')
-    deadline = scheduled_end
     currency = project_data.get('currency') or 'EGP'
 
     tasks = project_data.get('tasks', [])
@@ -118,6 +160,44 @@ def save_project(project_data):
         for m in milestones:
             m['status'] = 'Paid'
 
+    # 1. Save to Supabase Cloud if enabled
+    if is_cloud_enabled():
+        url, _ = get_cloud_credentials()
+        payload = {
+            "project_code": code,
+            "name": project_data['name'],
+            "client_name": project_data['client_name'],
+            "client_contact": project_data.get('client_contact', ''),
+            "discipline": project_data['discipline'],
+            "start_date": project_data['start_date'],
+            "scheduled_end_date": scheduled_end,
+            "deadline": scheduled_end,
+            "cost": float(project_data['cost']),
+            "currency": currency,
+            "weekend_type": project_data.get('weekend_type', 'Fri-Sat'),
+            "scope_description": project_data.get('scope_description', ''),
+            "remarks": project_data.get('remarks', ''),
+            "is_finished": is_fin,
+            "actual_end_date": project_data.get('actual_end_date'),
+            "is_cash_received": is_cash,
+            "received_cash_date": project_data.get('received_cash_date'),
+            "received_amount": float(project_data.get('received_amount', 0.0)),
+            "status": 'Completed' if is_fin else project_data.get('status', 'In Progress'),
+            "tasks_json": json.dumps(tasks),
+            "milestones_json": json.dumps(milestones),
+            "updated_at": datetime.now().isoformat()
+        }
+        try:
+            r = requests.post(f"{url}/rest/v1/projects", headers=get_supabase_headers(), json=payload, timeout=8)
+            if r.status_code in (200, 201) and r.json():
+                new_id = r.json()[0]['id']
+                return new_id
+        except Exception as e:
+            print(f"Supabase save failed, falling back to local: {e}")
+
+    # 2. Local SQLite save
+    conn = get_connection()
+    cursor = conn.cursor()
     cursor.execute("""
     INSERT INTO projects (
         project_code, name, client_name, client_contact, discipline, 
@@ -156,8 +236,6 @@ def save_project(project_data):
     return new_id
 
 def update_project(project_id, project_data):
-    conn = get_connection()
-    cursor = conn.cursor()
     scheduled_end = project_data.get('scheduled_end_date') or project_data.get('deadline')
     currency = project_data.get('currency') or 'EGP'
     
@@ -176,6 +254,48 @@ def update_project(project_id, project_data):
         for m in milestones:
             m['status'] = 'Paid'
 
+    # Cloud update
+    if is_cloud_enabled():
+        url, _ = get_cloud_credentials()
+        payload = {
+            "project_code": project_data.get('project_code'),
+            "name": project_data['name'],
+            "client_name": project_data['client_name'],
+            "client_contact": project_data.get('client_contact', ''),
+            "discipline": project_data['discipline'],
+            "start_date": project_data['start_date'],
+            "scheduled_end_date": scheduled_end,
+            "deadline": scheduled_end,
+            "cost": float(project_data['cost']),
+            "currency": currency,
+            "weekend_type": project_data.get('weekend_type', 'Fri-Sat'),
+            "scope_description": project_data.get('scope_description', ''),
+            "remarks": project_data.get('remarks', ''),
+            "is_finished": is_fin,
+            "actual_end_date": project_data.get('actual_end_date'),
+            "is_cash_received": is_cash,
+            "received_cash_date": project_data.get('received_cash_date'),
+            "received_amount": float(project_data.get('received_amount', 0.0)),
+            "status": 'Completed' if is_fin else project_data.get('status', 'In Progress'),
+            "tasks_json": json.dumps(tasks),
+            "milestones_json": json.dumps(milestones),
+            "updated_at": datetime.now().isoformat()
+        }
+        try:
+            r = requests.patch(
+                f"{url}/rest/v1/projects?id=eq.{project_id}",
+                headers=get_supabase_headers(),
+                json=payload,
+                timeout=8
+            )
+            if r.status_code in (200, 204):
+                return
+        except Exception as e:
+            print(f"Supabase update failed, falling back to local: {e}")
+
+    # Local update
+    conn = get_connection()
+    cursor = conn.cursor()
     cursor.execute("""
     UPDATE projects SET
         project_code = ?,
@@ -230,6 +350,24 @@ def update_project(project_id, project_data):
     conn.close()
 
 def get_all_projects():
+    if is_cloud_enabled():
+        url, _ = get_cloud_credentials()
+        try:
+            r = requests.get(f"{url}/rest/v1/projects?select=*&order=id.desc", headers=get_supabase_headers(), timeout=8)
+            if r.status_code == 200:
+                projects = []
+                for item in r.json():
+                    item['tasks'] = json.loads(item['tasks_json']) if item.get('tasks_json') else []
+                    item['milestones'] = json.loads(item['milestones_json']) if item.get('milestones_json') else []
+                    if not item.get('scheduled_end_date'):
+                        item['scheduled_end_date'] = item.get('deadline', '')
+                    if not item.get('currency'):
+                        item['currency'] = 'EGP'
+                    projects.append(item)
+                return projects
+        except Exception as e:
+            print(f"Supabase read failed, falling back to local: {e}")
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM projects ORDER BY id DESC")
@@ -248,6 +386,22 @@ def get_all_projects():
     return projects
 
 def get_project_by_id(project_id):
+    if is_cloud_enabled():
+        url, _ = get_cloud_credentials()
+        try:
+            r = requests.get(f"{url}/rest/v1/projects?id=eq.{project_id}&select=*&limit=1", headers=get_supabase_headers(), timeout=8)
+            if r.status_code == 200 and r.json():
+                item = r.json()[0]
+                item['tasks'] = json.loads(item['tasks_json']) if item.get('tasks_json') else []
+                item['milestones'] = json.loads(item['milestones_json']) if item.get('milestones_json') else []
+                if not item.get('scheduled_end_date'):
+                    item['scheduled_end_date'] = item.get('deadline', '')
+                if not item.get('currency'):
+                    item['currency'] = 'EGP'
+                return item
+        except Exception:
+            pass
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
@@ -265,6 +419,13 @@ def get_project_by_id(project_id):
     return item
 
 def delete_project(project_id):
+    if is_cloud_enabled():
+        url, _ = get_cloud_credentials()
+        try:
+            requests.delete(f"{url}/rest/v1/projects?id=eq.{project_id}", headers=get_supabase_headers(), timeout=8)
+        except Exception:
+            pass
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM projects WHERE id = ?", (project_id,))
@@ -272,56 +433,23 @@ def delete_project(project_id):
     conn.close()
 
 def get_received_cash_records():
-    """
-    Returns all projects where cash has been received,
-    ordered chronologically by received_cash_date.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, project_code, name, client_name, cost, currency, 
-           received_amount, received_cash_date, actual_end_date, scheduled_end_date
-    FROM projects 
-    WHERE is_cash_received = 1 AND received_cash_date IS NOT NULL AND received_cash_date != ''
-    ORDER BY received_cash_date DESC
-    """)
-    rows = cursor.fetchall()
-    conn.close()
-    
-    results = []
-    for r in rows:
-        item = dict(r)
-        if not item.get('currency'):
-            item['currency'] = 'EGP'
-        results.append(item)
-    return results
+    all_projs = get_all_projects()
+    records = [
+        p for p in all_projs 
+        if p.get('is_cash_received') and p.get('received_cash_date')
+    ]
+    records.sort(key=lambda x: x.get('received_cash_date', ''), reverse=True)
+    return records
 
 def get_pending_payment_followups():
-    """
-    Identifies projects that are FINISHED (is_finished = 1)
-    but CASH NOT YET RECEIVED (is_cash_received = 0).
-    Calculates follow-up intervals (every 10 days since actual completion).
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, project_code, name, client_name, client_contact, 
-           cost, currency, actual_end_date, scheduled_end_date, remarks
-    FROM projects 
-    WHERE is_finished = 1 AND (is_cash_received = 0 OR is_cash_received IS NULL)
-    ORDER BY actual_end_date ASC
-    """)
-    rows = cursor.fetchall()
-    conn.close()
-    
+    all_projs = get_all_projects()
     today = date.today()
     followups = []
     
-    for r in rows:
-        item = dict(r)
-        if not item.get('currency'):
-            item['currency'] = 'EGP'
-            
+    pending = [p for p in all_projs if p.get('is_finished') and not p.get('is_cash_received')]
+    pending.sort(key=lambda x: x.get('actual_end_date') or '', reverse=False)
+
+    for item in pending:
         actual_str = item.get("actual_end_date")
         if actual_str:
             try:
@@ -344,3 +472,29 @@ def get_pending_payment_followups():
         followups.append(item)
         
     return followups
+
+# ---------------- 1-TAP BACKUP & RESTORE UTILITIES ----------------
+def export_database_json():
+    """Serializes all project records into a clean portable JSON backup string."""
+    projs = get_all_projects()
+    return json.dumps(projs, indent=2, ensure_ascii=False)
+
+def import_database_json(json_content):
+    """Restores projects from a JSON backup into the active database."""
+    try:
+        data = json.loads(json_content)
+        if not isinstance(data, list):
+            return False, "Invalid format: Expected a list of projects."
+        
+        count = 0
+        for item in data:
+            # Check if project code already exists
+            existing = [p for p in get_all_projects() if p.get('project_code') == item.get('project_code')]
+            if existing:
+                update_project(existing[0]['id'], item)
+            else:
+                save_project(item)
+            count += 1
+        return True, f"Successfully imported/synchronized {count} projects!"
+    except Exception as e:
+        return False, f"Import error: {str(e)}"
