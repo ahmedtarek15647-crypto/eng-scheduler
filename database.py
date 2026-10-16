@@ -143,6 +143,7 @@ def get_next_project_code():
 def save_project(project_data):
     code = project_data.get('project_code') or get_next_project_code()
     scheduled_end = project_data.get('scheduled_end_date') or project_data.get('deadline')
+    deadline = scheduled_end
     currency = project_data.get('currency') or 'EGP'
 
     tasks = project_data.get('tasks', [])
@@ -237,6 +238,7 @@ def save_project(project_data):
 
 def update_project(project_id, project_data):
     scheduled_end = project_data.get('scheduled_end_date') or project_data.get('deadline')
+    deadline = scheduled_end
     currency = project_data.get('currency') or 'EGP'
     
     is_fin = 1 if project_data.get('is_finished') else 0
